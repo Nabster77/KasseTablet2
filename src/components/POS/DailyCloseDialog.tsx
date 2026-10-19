@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { X, Lock, FileDown, Check, AlertTriangle, Calculator } from 'lucide-react';
+import { X, Lock, FileDown, Check, TriangleAlert as AlertTriangle, Calculator } from 'lucide-react';
 import { formatCurrency, formatDateLong, formatTime, formatWeekdayShort } from '@/lib/format';
 import { mergeTaxByRate, getTaxByRate, sortedRateKeys } from '@/lib/tax';
 import type { CashSession, Transaction } from '@/types';
@@ -359,31 +359,20 @@ function generatePDF(
   <table><thead><tr><th>#</th><th>Uhrzeit</th><th>Artikel</th><th>Betrag</th><th>MwSt</th></tr></thead><tbody>${rows}</tbody></table>
   ${corrections ? `<h2>Anfangsbestand-Korrekturen</h2><table><thead><tr><th>Uhrzeit</th><th>Alt</th><th>Neu</th><th>Grund</th></tr></thead><tbody>${corrections}</tbody></table>` : ''}
   ${entries ? `<h2>Einlagen / Ausgaben</h2><table><thead><tr><th>Uhrzeit</th><th>Typ</th><th>Betrag</th><th>Grund</th></tr></thead><tbody>${entries}</tbody></table>` : ''}
-  <script>window.onload = () => window.print();</script>
   </body></html>`;
 
-  const frame = document.createElement('iframe');
-  frame.setAttribute('title', 'Druckvorschau Tagesabschluss');
-  frame.style.position = 'fixed';
-  frame.style.left = '-10000px';
-  frame.style.top = '0';
-  frame.style.width = '1px';
-  frame.style.height = '1px';
-  frame.style.border = '0';
-  frame.onload = () => {
-    const cw = frame.contentWindow;
-    if (!cw) return;
-    let removed = false;
-    const cleanup = () => {
-      if (removed) return;
-      removed = true;
-      try { frame.remove(); } catch { /* already gone */ }
-    };
-    cw.addEventListener('afterprint', cleanup);
-    cw.focus();
-    cw.print();
-    window.setTimeout(cleanup, 120000);
+  const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const printWin = window.open(url, '_blank', 'width=900,height=700');
+  if (!printWin) {
+    alert('Bitte Popups für diese Seite erlauben, um den PDF-Export zu nutzen.');
+    URL.revokeObjectURL(url);
+    return;
+  }
+  const triggerPrint = () => {
+    try { printWin.focus(); printWin.print(); } catch { /* ignore */ }
   };
-  frame.srcdoc = html;
-  document.body.appendChild(frame);
+  printWin.onload = triggerPrint;
+  setTimeout(triggerPrint, 600);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }

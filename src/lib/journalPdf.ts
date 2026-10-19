@@ -1,5 +1,5 @@
-import type { Category, Transaction } from '@/types';
-import { formatCurrency, formatDate, formatDateLong, formatTime } from '@/lib/format';
+import type { Category, Transaction, Location } from '@/types';
+import { formatCurrency, formatDate, formatTime } from '@/lib/format';
 import { isTaxFreeItem, getTaxByRate } from '@/lib/tax';
 
 interface ExportData {
@@ -18,30 +18,58 @@ interface ExportData {
   groupMode: string;
 }
 
-export function generateJournalPDF(data: ExportData) {
-  const { headerLabel, location, transactions, categories, stats, groupMode } = data;
+interface LocationStats {
+  total: number;
+  totalNet: number;
+  totalTax: number;
+  totalPfand: number;
+  count: number;
+  taxByRate: Record<number, number>;
+}
 
-  // Category breakdown
-  const catMap = new Map<string, { name: string; total: number; count: number; pfand: number }>();
-  for (const tx of transactions) {
+const LOCATION_META: Record<Location, { label: string; sub: string; color: string; bar: string }> = {
+  Friedrichshafen: { label: 'Kasse 1', sub: 'Friedrichshafen', color: '#1e3a5f', bar: '#2563eb' },
+  Bregenz: { label: 'Kasse 2', sub: 'Bregenz', color: '#0f766e', bar: '#0d9488' },
+};
+
+function computeStats(txs: Transaction[]): LocationStats {
+  let total = 0, totalNet = 0, totalPfand = 0, count = 0;
+  const taxByRate: Record<number, number> = {};
+  for (const t of txs) {
+    total += t.total;
+    totalNet += t.totalNet;
+    totalPfand += t.totalPfand;
+    count++;
+    for (const [k, v] of getTaxByRate(t)) {
+      taxByRate[k] = (taxByRate[k] ?? 0) + v;
+    }
+  }
+  const totalTax = Object.values(taxByRate).reduce((s, v) => s + v, 0);
+  return { total, totalNet, totalTax, totalPfand, count, taxByRate };
+}
+
+function categoryRows(txs: Transaction[], categories: Category[]): string {
+  const map = new Map<string, { name: string; total: number; count: number; pfand: number }>();
+  for (const tx of txs) {
     for (const item of tx.items) {
       const isPfand = isTaxFreeItem(item);
       const cat = categories.find((c) => c.id === item.categoryId);
       const key = isPfand ? '__pfand__' : item.categoryId;
-      if (!catMap.has(key)) catMap.set(key, { name: isPfand ? 'Pfand' : cat?.name ?? 'Unbekannt', total: 0, count: 0, pfand: 0 });
-      const g = catMap.get(key)!;
+      if (!map.has(key)) map.set(key, { name: isPfand ? 'Pfand' : cat?.name ?? 'Unbekannt', total: 0, count: 0, pfand: 0 });
+      const g = map.get(key)!;
       g.total += item.price * item.quantity;
       g.count += item.quantity;
       g.pfand += item.pfand;
     }
   }
-  const catRows = [...catMap.values()].sort((a, b) => b.total - a.total)
+  return [...map.values()].sort((a, b) => b.total - a.total)
     .map((g) => `<tr><td>${g.name}</td><td style="text-align:right">${g.count}</td><td style="text-align:right">${formatCurrency(g.pfand)}</td><td style="text-align:right"><b>${formatCurrency(g.total)}</b></td></tr>`)
     .join('');
+}
 
-  // Article breakdown
+function articleRows(txs: Transaction[]): { rows: string; bestRows: string; artMap: Map<string, { name: string; count: number; total: number; taxRate: number }> } {
   const artMap = new Map<string, { name: string; count: number; total: number; taxRate: number }>();
-  for (const tx of transactions) {
+  for (const tx of txs) {
     for (const item of tx.items) {
       const key = `${item.productId}-${item.name}`;
       const isTaxFree = isTaxFreeItem(item);
@@ -51,26 +79,29 @@ export function generateJournalPDF(data: ExportData) {
       g.total += item.price * item.quantity;
     }
   }
-  const artRows = [...artMap.values()].sort((a, b) => b.total - a.total)
+  const rows = [...artMap.values()].sort((a, b) => b.total - a.total)
     .map((g) => `<tr><td>${g.name}</td><td style="text-align:right">${g.taxRate === 0 ? 'steuerfrei' : `${g.taxRate}%`}</td><td style="text-align:right">${g.count}</td><td style="text-align:right"><b>${formatCurrency(g.total)}</b></td></tr>`)
     .join('');
+  const bestRows = [...artMap.values()].sort((a, b) => b.count - a.count).slice(0, 10)
+    .map((g, i) => `<tr><td>${i + 1}</td><td>${g.name}</td><td style="text-align:right">${g.count}</td><td style="text-align:right"><b>${formatCurrency(g.total)}</b></td></tr>`)
+    .join('');
+  return { rows, bestRows, artMap };
+}
 
-  // Tax breakdown — by actual rate, dynamic
+function taxCards(txs: Transaction[]): { cards: string; columns: number } {
   const taxData = new Map<number, { gross: number; net: number; tax: number; count: number }>();
-  for (const tx of transactions) {
+  for (const tx of txs) {
     for (const item of tx.items) {
       if (isTaxFreeItem(item)) continue;
       const rate = item.taxRate;
       const gross = item.price * item.quantity;
-      const net = item.netPrice;
-      const tax = item.taxAmount;
       const g = taxData.get(rate) ?? { gross: 0, net: 0, tax: 0, count: 0 };
-      g.gross += gross; g.net += net; g.tax += tax; g.count += item.quantity;
+      g.gross += gross; g.net += item.netPrice; g.tax += item.taxAmount; g.count += item.quantity;
       taxData.set(rate, g);
     }
   }
   const sortedRates = [...taxData.keys()].sort((a, b) => a - b);
-  const taxCards = sortedRates.map((rate) => {
+  const cards = sortedRates.map((rate) => {
     const d = taxData.get(rate)!;
     return `<div class="tax-card"><h3>MwSt ${rate}%</h3>
       <div class="row"><span>Bruttoumsatz</span><span>${formatCurrency(d.gross)}</span></div>
@@ -78,26 +109,147 @@ export function generateJournalPDF(data: ExportData) {
       <div class="row bold"><span>MwSt-Anteil</span><span>${formatCurrency(d.tax)}</span></div>
       <div class="row"><span>Verkaufte Menge</span><span>${d.count}</span></div></div>`;
   }).join('');
+  return { cards, columns: sortedRates.length > 0 ? sortedRates.length : 2 };
+}
 
-  const taxColumns = sortedRates.length > 0 ? sortedRates.length : 2;
-
-  // Transaction list
-  const txRows = [...transactions].sort((a, b) => a.timestamp - b.timestamp)
+function transactionRows(txs: Transaction[]): string {
+  return [...txs].sort((a, b) => a.timestamp - b.timestamp)
     .map((tx, i) => {
       const txTax = [...getTaxByRate(tx).values()].reduce((s, v) => s + v, 0);
       return `<tr><td>${i + 1}</td><td>${formatDate(tx.timestamp)} ${formatTime(tx.timestamp)}</td><td>${tx.items.length}</td><td style="text-align:right">${formatCurrency(tx.total)}</td><td style="text-align:right">${formatCurrency(txTax)}</td><td>${tx.paymentMethod === 'cash' ? 'BAR' : 'KARTE'}</td></tr>`;
     })
     .join('');
+}
 
-  // Bestseller
-  const bestRows = [...artMap.values()].sort((a, b) => b.count - a.count).slice(0, 10)
-    .map((g, i) => `<tr><td>${i + 1}</td><td>${g.name}</td><td style="text-align:right">${g.count}</td><td style="text-align:right"><b>${formatCurrency(g.total)}</b></td></tr>`)
-    .join('');
-
-  const generatedAt = new Date().toLocaleString('de-DE');
-  const taxSummaryLine = sortedRates.length > 0
-    ? sortedRates.map((r) => `MwSt ${r}%: ${formatCurrency(stats.taxByRate[r] ?? 0)}`).join(' · ')
+function summaryCards(s: LocationStats, accentColor: string): string {
+  const taxSummaryLine = Object.keys(s.taxByRate).length > 0
+    ? Object.entries(s.taxByRate).map(([r, v]) => `MwSt ${r}%: ${formatCurrency(v)}`).join(' · ')
     : '—';
+  return `<div class="summary-grid">
+    <div class="summary-card accent"><div class="label">Umsatz (inkl. MwSt.)</div><div class="value" style="color:${accentColor}">${formatCurrency(s.total)}</div></div>
+    <div class="summary-card"><div class="label">Netto</div><div class="value">${formatCurrency(s.totalNet)}</div></div>
+    <div class="summary-card"><div class="label">MwSt gesamt</div><div class="value">${formatCurrency(s.totalTax)}</div></div>
+    <div class="summary-card pfand"><div class="label">Pfand</div><div class="value">${formatCurrency(s.totalPfand)}</div></div>
+    <div class="summary-card count"><div class="label">Verkäufe</div><div class="value">${s.count}</div></div>
+    <div class="summary-card"><div class="label">MwSt nach Satz</div><div class="value" style="font-size:11px">${taxSummaryLine}</div></div>
+  </div>`;
+}
+
+function locationSection(loc: Location, txs: Transaction[], categories: Category[]): string {
+  const meta = LOCATION_META[loc];
+  const s = computeStats(txs);
+  const cats = categoryRows(txs, categories);
+  const { rows: arts, bestRows } = articleRows(txs);
+  const { cards: taxCds, columns } = taxCards(txs);
+  const txRows = transactionRows(txs);
+  const isEmpty = txs.length === 0;
+
+  return `<div class="loc-section" style="border-color:${meta.bar}">
+    <div class="loc-header" style="background:${meta.bar}">
+      <div class="loc-title">${meta.label} · ${meta.sub}</div>
+      <div class="loc-sub">${txs.length} Transaktion${txs.length === 1 ? '' : 'en'} · Umsatz ${formatCurrency(s.total)}</div>
+    </div>
+    <div class="loc-body">
+      ${isEmpty ? `<div class="empty">Keine Verkäufe für diesen Standort im gewählten Zeitraum.</div>` : `
+      ${summaryCards(s, meta.color)}
+      <h2 style="color:${meta.color}">Mehrwertsteuer-Klassen</h2>
+      <div class="tax-section" style="grid-template-columns: repeat(${Math.min(columns, 4)}, 1fr)">
+        ${taxCds || '<div class="tax-card">Keine steuerpflichtigen Umsätze</div>'}
+      </div>
+      <h2 style="color:${meta.color}">Warengruppen</h2>
+      <table><thead><tr><th>Gruppe</th><th style="text-align:right">Menge</th><th style="text-align:right">Pfand</th><th style="text-align:right">Umsatz</th></tr></thead><tbody>${cats}</tbody></table>
+      <h2 style="color:${meta.color}">Einzelartikel</h2>
+      <table><thead><tr><th>Artikel</th><th style="text-align:right">MwSt</th><th style="text-align:right">Menge</th><th style="text-align:right">Umsatz</th></tr></thead><tbody>${arts}</tbody></table>
+      <h2 style="color:${meta.color}">Bestseller (Top 10)</h2>
+      <table><thead><tr><th>#</th><th>Artikel</th><th style="text-align:right">Menge</th><th style="text-align:right">Umsatz</th></tr></thead><tbody>${bestRows}</tbody></table>
+      <h2 style="color:${meta.color}">Einzel-Bons (${txs.length})</h2>
+      <table><thead><tr><th>#</th><th>Datum/Zeit</th><th>Artikel</th><th style="text-align:right">Betrag</th><th style="text-align:right">MwSt</th><th>Zahlart</th></tr></thead><tbody>${txRows}</tbody></table>
+      `}
+    </div>
+  </div>`;
+}
+
+function combinedSection(transactions: Transaction[], categories: Category[], stats: LocationStats): string {
+  const cats = categoryRows(transactions, categories);
+  const { rows: arts, bestRows } = articleRows(transactions);
+  const { cards: taxCds, columns } = taxCards(transactions);
+  const txRows = transactionRows(transactions);
+  const taxSummaryLine = Object.keys(stats.taxByRate).length > 0
+    ? Object.entries(stats.taxByRate).map(([r, v]) => `MwSt ${r}%: ${formatCurrency(v)}`).join(' · ')
+    : '—';
+
+  return `<div class="loc-section combined">
+    <div class="loc-header combined-header">
+      <div class="loc-title">Gesamtübersicht · Beide Kassen</div>
+      <div class="loc-sub">${transactions.length} Transaktionen · Umsatz ${formatCurrency(stats.total)}</div>
+    </div>
+    <div class="loc-body">
+      <div class="summary-grid">
+        <div class="summary-card accent"><div class="label">Umsatz (inkl. MwSt.)</div><div class="value">${formatCurrency(stats.total)}</div></div>
+        <div class="summary-card"><div class="label">Netto</div><div class="value">${formatCurrency(stats.totalNet)}</div></div>
+        <div class="summary-card"><div class="label">MwSt gesamt</div><div class="value">${formatCurrency(stats.totalTax)}</div></div>
+        <div class="summary-card pfand"><div class="label">Pfand</div><div class="value">${formatCurrency(stats.totalPfand)}</div></div>
+        <div class="summary-card count"><div class="label">Verkäufe</div><div class="value">${stats.count}</div></div>
+        <div class="summary-card"><div class="label">MwSt nach Satz</div><div class="value" style="font-size:11px">${taxSummaryLine}</div></div>
+      </div>
+      <h2>Mehrwertsteuer-Klassen</h2>
+      <div class="tax-section" style="grid-template-columns: repeat(${Math.min(columns, 4)}, 1fr)">
+        ${taxCds || '<div class="tax-card">Keine steuerpflichtigen Umsätze</div>'}
+      </div>
+      <h2>Warengruppen</h2>
+      <table><thead><tr><th>Gruppe</th><th style="text-align:right">Menge</th><th style="text-align:right">Pfand</th><th style="text-align:right">Umsatz</th></tr></thead><tbody>${cats}</tbody></table>
+      <h2>Einzelartikel</h2>
+      <table><thead><tr><th>Artikel</th><th style="text-align:right">MwSt</th><th style="text-align:right">Menge</th><th style="text-align:right">Umsatz</th></tr></thead><tbody>${arts}</tbody></table>
+      <h2>Bestseller (Top 10)</h2>
+      <table><thead><tr><th>#</th><th>Artikel</th><th style="text-align:right">Menge</th><th style="text-align:right">Umsatz</th></tr></thead><tbody>${bestRows}</tbody></table>
+      <h2>Einzel-Bons (${transactions.length})</h2>
+      <table><thead><tr><th>#</th><th>Datum/Zeit</th><th>Artikel</th><th style="text-align:right">Betrag</th><th style="text-align:right">MwSt</th><th>Zahlart</th></tr></thead><tbody>${txRows}</tbody></table>
+    </div>
+  </div>`;
+}
+
+export function generateJournalPDF(data: ExportData) {
+  const { headerLabel, location, transactions, categories } = data;
+  const generatedAt = new Date().toLocaleString('de-DE');
+
+  const isBoth = location.includes('Beide') || location.includes('Kasse 1 + Kasse 2') || location.toLowerCase().includes('alle');
+
+  let body: string;
+  if (isBoth) {
+    const fhTx = transactions.filter((t) => t.location === 'Friedrichshafen');
+    const bgTx = transactions.filter((t) => t.location === 'Bregenz');
+    const totalStats = computeStats(transactions);
+
+    // Location comparison summary at the very top
+    const fhStats = computeStats(fhTx);
+    const bgStats = computeStats(bgTx);
+    const compareRow = (label: string, fh: string, bg: string, total: string) =>
+      `<tr><td>${label}</td><td style="text-align:right"><b>${fh}</b></td><td style="text-align:right"><b>${bg}</b></td><td style="text-align:right"><b>${total}</b></td></tr>`;
+
+    const comparison = `<h2>Standort-Vergleich</h2>
+      <table class="compare-table">
+        <thead><tr><th>Kennzahl</th><th style="text-align:right">Kasse 1 · Friedrichshafen</th><th style="text-align:right">Kasse 2 · Bregenz</th><th style="text-align:right">Gesamt</th></tr></thead>
+        <tbody>
+          ${compareRow('Verkäufe', String(fhStats.count), String(bgStats.count), String(totalStats.count))}
+          ${compareRow('Brutto-Umsatz', formatCurrency(fhStats.total), formatCurrency(bgStats.total), formatCurrency(totalStats.total))}
+          ${compareRow('Netto-Umsatz', formatCurrency(fhStats.totalNet), formatCurrency(bgStats.totalNet), formatCurrency(totalStats.totalNet))}
+          ${compareRow('MwSt gesamt', formatCurrency(fhStats.totalTax), formatCurrency(bgStats.totalTax), formatCurrency(totalStats.totalTax))}
+          ${compareRow('Pfand', formatCurrency(fhStats.totalPfand), formatCurrency(bgStats.totalPfand), formatCurrency(totalStats.totalPfand))}
+        </tbody>
+      </table>`;
+
+    body = `${comparison}
+      <div class="loc-pagebreak"></div>
+      ${locationSection('Friedrichshafen', fhTx, categories)}
+      <div class="loc-pagebreak"></div>
+      ${locationSection('Bregenz', bgTx, categories)}
+      <div class="loc-pagebreak"></div>
+      ${combinedSection(transactions, categories, totalStats)}`;
+  } else {
+    // Single location — render once with clear header
+    const loc = transactions[0]?.location ?? (location.includes('Bregenz') ? 'Bregenz' : 'Friedrichshafen');
+    body = locationSection(loc, transactions, categories);
+  }
 
   const html = `<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
   <title>${headerLabel}</title>
@@ -119,72 +271,48 @@ export function generateJournalPDF(data: ExportData) {
     th { text-align: left; padding: 6px 8px; border-bottom: 2px solid #333; color: #333; font-size: 10px; text-transform: uppercase; }
     td { padding: 4px 8px; border-bottom: 1px solid #eee; }
     tr:nth-child(even) { background: #fafafa; }
+    .compare-table th { background: #1e3a5f; color: white; }
+    .compare-table td { padding: 8px; border-bottom: 1px solid #ddd; }
+    .compare-table tr:nth-child(even) { background: #f1f5f9; }
     .tax-section { display: grid; gap: 16px; margin-bottom: 16px; }
     .tax-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; }
     .tax-card h3 { font-size: 13px; margin-bottom: 8px; }
     .tax-card .row { display: flex; justify-content: space-between; font-size: 12px; padding: 3px 0; }
     .tax-card .row.bold { font-weight: bold; border-top: 1px solid #ccc; margin-top: 6px; padding-top: 6px; }
+    .loc-section { margin: 24px 0; border: 2px solid #ccc; border-radius: 12px; overflow: hidden; }
+    .loc-header { padding: 14px 18px; color: white; display: flex; justify-content: space-between; align-items: center; }
+    .loc-title { font-size: 17px; font-weight: bold; }
+    .loc-sub { font-size: 12px; opacity: 0.9; }
+    .loc-header.combined-header { background: #1e3a5f; }
+    .loc-body { padding: 16px 18px; }
+    .loc-pagebreak { page-break-after: always; height: 0; }
+    .empty { padding: 24px; text-align: center; color: #94a3b8; font-size: 13px; background: #f8fafc; border-radius: 8px; }
     .footer { margin-top: 32px; padding-top: 12px; border-top: 1px solid #ccc; font-size: 10px; color: #999; text-align: center; }
-    .badge { display: inline-block; background: #2563eb; color: white; font-size: 10px; padding: 2px 8px; border-radius: 12px; margin-left: 8px; }
-    @media print { body { padding: 20px; } .summary-grid { grid-template-columns: repeat(6, 1fr); } }
+    @media print { body { padding: 20px; } .summary-grid { grid-template-columns: repeat(6, 1fr); } .loc-pagebreak { page-break-after: always; } }
   </style></head><body>
   <div class="header">
     <h1>Kassenjournal</h1>
     <div class="meta">${headerLabel}${location ? ` | Standort: ${location}` : ''} | Erstellt: ${generatedAt}</div>
   </div>
-
-  <h2>Zusammenfassung</h2>
-  <div class="summary-grid">
-    <div class="summary-card accent"><div class="label">Umsatz (inkl. MwSt.)</div><div class="value">${formatCurrency(stats.total)}</div></div>
-    <div class="summary-card"><div class="label">Netto</div><div class="value">${formatCurrency(stats.totalNet)}</div></div>
-    <div class="summary-card"><div class="label">MwSt gesamt</div><div class="value">${formatCurrency(stats.totalTax)}</div></div>
-    <div class="summary-card pfand"><div class="label">Pfand</div><div class="value">${formatCurrency(stats.totalPfand)}</div></div>
-    <div class="summary-card count"><div class="label">Verkäufe</div><div class="value">${stats.count}</div></div>
-    <div class="summary-card"><div class="label">MwSt nach Satz</div><div class="value" style="font-size:11px">${taxSummaryLine}</div></div>
-  </div>
-
-  <h2>Mehrwertsteuer-Klassen</h2>
-  <div class="tax-section" style="grid-template-columns: repeat(${Math.min(taxColumns, 4)}, 1fr)">
-    ${taxCards || '<div class="tax-card">Keine steuerpflichtigen Umsätze</div>'}
-  </div>
-
-  <h2>Warengruppen</h2>
-  <table><thead><tr><th>Gruppe</th><th style="text-align:right">Menge</th><th style="text-align:right">Pfand</th><th style="text-align:right">Umsatz</th></tr></thead><tbody>${catRows}</tbody></table>
-
-  <h2>Einzelartikel</h2>
-  <table><thead><tr><th>Artikel</th><th style="text-align:right">MwSt</th><th style="text-align:right">Menge</th><th style="text-align:right">Umsatz</th></tr></thead><tbody>${artRows}</tbody></table>
-
-  <h2>Bestseller (Top 10)</h2>
-  <table><thead><tr><th>#</th><th>Artikel</th><th style="text-align:right">Menge</th><th style="text-align:right">Umsatz</th></tr></thead><tbody>${bestRows}</tbody></table>
-
-  <h2>Einzel-Bons (${transactions.length})</h2>
-  <table><thead><tr><th>#</th><th>Datum/Zeit</th><th>Artikel</th><th style="text-align:right">Betrag</th><th style="text-align:right">MwSt</th><th>Zahlart</th></tr></thead><tbody>${txRows}</tbody></table>
-
+  ${body}
   <div class="footer">Kassenjournal automatisch generiert | ${generatedAt}</div>
   </body></html>`;
 
-  const frame = document.createElement('iframe');
-  frame.setAttribute('title', 'Druckvorschau Kassenjournal');
-  frame.style.position = 'fixed';
-  frame.style.left = '-10000px';
-  frame.style.top = '0';
-  frame.style.width = '1px';
-  frame.style.height = '1px';
-  frame.style.border = '0';
-  frame.onload = () => {
-    const cw = frame.contentWindow;
-    if (!cw) return;
-    let removed = false;
-    const cleanup = () => {
-      if (removed) return;
-      removed = true;
-      try { frame.remove(); } catch { /* already gone */ }
-    };
-    cw.addEventListener('afterprint', cleanup);
-    cw.focus();
-    cw.print();
-    window.setTimeout(cleanup, 120000);
+  const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const printWin = window.open(url, '_blank', 'width=900,height=700');
+  if (!printWin) {
+    alert('Bitte Popups für diese Seite erlauben, um den PDF-Export zu nutzen.');
+    URL.revokeObjectURL(url);
+    return;
+  }
+  // Trigger print once the document has loaded. Whether the user prints
+  // or cancels, the main app is unaffected — the popup stays open for review.
+  const triggerPrint = () => {
+    try { printWin.focus(); printWin.print(); } catch { /* ignore */ }
   };
-  frame.srcdoc = html;
-  document.body.appendChild(frame);
+  printWin.onload = triggerPrint;
+  setTimeout(triggerPrint, 600);
+  // Revoke the blob URL after the window has had time to load it.
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }

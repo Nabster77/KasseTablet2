@@ -11,7 +11,7 @@ import { DailyCloseDialog } from './DailyCloseDialog';
 import { ShotSelectionDialog } from './ShotSelectionDialog';
 import { PfandRetoureDialog } from './PfandRetoureDialog';
 import { DynamicIcon } from '@/components/DynamicIcon';
-import { formatCurrency } from '@/lib/format';
+import { formatDateLong } from '@/lib/format';
 import { SHOT_OPTIONS } from '@/lib/seed';
 import {
   ShoppingCart, Trash2, Search, Lock, MapPin, Move,
@@ -161,18 +161,6 @@ export function POSScreen({
 
   const cartCount = cart.reduce((sum, c) => sum + c.quantity, 0);
 
-  const currentBalance = activeSession
-    ? activeSession.openingBalance +
-      activeSession.entries.reduce((s, e) => s + (e.type === 'deposit' ? e.amount : -e.amount), 0) +
-      transactions
-        .filter((t) => {
-          const d = new Date(t.timestamp);
-          const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-          return ds === activeSession.date && t.location === activeSession.location;
-        })
-        .reduce((s, t) => s + t.total, 0)
-    : 0;
-
   function handleCheckoutComplete(tx: Transaction) {
     onCheckout(tx);
     setCart([]);
@@ -189,9 +177,8 @@ export function POSScreen({
               <span className="font-semibold text-gray-900 dark:text-gray-100">{activeSession.location}</span>
             </div>
             <div className="text-sm text-gray-500 dark:text-gray-400">
-              Kasse: <span className="font-bold text-gray-900 dark:text-gray-100">{formatCurrency(currentBalance)}</span>
+              {formatDateLong(activeSession.openedAt)}
             </div>
-            <div className="text-xs text-gray-400">Anfangsbestand: {formatCurrency(activeSession.openingBalance)}</div>
             <div className="ml-auto flex items-center gap-1.5">
               <button onClick={() => setShowCorrection(true)}
                 className="flex items-center gap-1 rounded-lg bg-amber-50 px-2.5 py-1.5 text-xs font-semibold text-amber-700 transition hover:bg-amber-100 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50">
